@@ -108,8 +108,9 @@ from vllm_ascend.utils import (AscendDeviceType, ProfileExecuteDuration,
                                lmhead_tp_enable, maybe_trans_nz,
                                set_weight_prefetch_method, vllm_version_is)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+from vllm_ascend.worker.npu_dualstream_batch_wrapper import \
+    DualStreamUBatchWrapper
 from vllm_ascend.worker.npu_ubatch_wrapper import AscendUBatchWrapper
-from vllm_ascend.worker.npu_dualstream_batch_wrapper import DualStreamUBatchWrapper
 from vllm_ascend.worker.pcp_utils import PCPManager
 from vllm_ascend.worker.ubatch_utils import (check_enable_ubatch,
                                              maybe_create_ubatch_slices)
@@ -493,7 +494,8 @@ class NPUModelRunner(GPUModelRunner):
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
-        if isinstance(self.model, (ACLGraphWrapper, AscendUBatchWrapper, DualStreamUBatchWrapper)):
+        if isinstance(self.model, (ACLGraphWrapper, AscendUBatchWrapper,
+                                    DualStreamUBatchWrapper)):
             return self.model.unwrap()
         return self.model
 
@@ -2505,19 +2507,20 @@ class NPUModelRunner(GPUModelRunner):
                     m.consumed_memory / float(2**30))
 
         # wrap the model with full graph wrapper if needed.
-        # Check if dual stream wrapper should be used
-        self.use_dual_stream = self.parallel_config.enable_dual_stream_wrapper
+        # Check whether the dual-stream wrapper should be used.
+        self.use_dual_stream = getattr(self.parallel_config,
+                                       'enable_dual_stream_wrapper', False)
         has_full = self.compilation_config.cudagraph_mode.has_full_cudagraphs()
-        
+
         if has_full:
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
             # TODO(zxdu): should update to use_ubatching in v0.14.0
             if self.use_dual_stream:
-                # Use DualStreamUBatchWrapper regardless of enable_dbo
-                logger.info("Using DualStreamUBatchWrapper (FULL cudagraph mode)")
-                self.model = DualStreamUBatchWrapper(self.model, self.vllm_config,
-                                                    CUDAGraphMode.FULL,
-                                                    self.device)
+                logger.info(
+                    "Using DualStreamUBatchWrapper (FULL cudagraph mode)")
+                self.model = DualStreamUBatchWrapper(
+                    self.model, self.vllm_config, CUDAGraphMode.FULL,
+                    self.device)
             elif self.parallel_config.enable_dbo:
                 self.model = AscendUBatchWrapper(self.model, self.vllm_config,
                                                  CUDAGraphMode.FULL,
@@ -2527,10 +2530,11 @@ class NPUModelRunner(GPUModelRunner):
                                              self.vllm_config,
                                              runtime_mode=CUDAGraphMode.FULL)
         elif self.use_dual_stream:
-            # Use DualStreamUBatchWrapper even without full cudagraphs
-            logger.info("Using DualStreamUBatchWrapper (PIECEWISE cudagraph mode)")
-            self.model = DualStreamUBatchWrapper(self.model, self.vllm_config,
-                                                 CUDAGraphMode.NONE, self.device)
+            logger.info(
+                "Using DualStreamUBatchWrapper (PIECEWISE cudagraph mode)")
+            self.model = DualStreamUBatchWrapper(
+                self.model, self.vllm_config, CUDAGraphMode.NONE,
+                self.device)
         elif self.parallel_config.enable_dbo:
             self.model = AscendUBatchWrapper(self.model, self.vllm_config,
                                              CUDAGraphMode.NONE, self.device)
@@ -3002,23 +3006,19 @@ class NPUModelRunner(GPUModelRunner):
             for (attn_backend,
                  kv_cache_spec), layer_names in attn_backends_map.items():
                 # TODO(zxdu): should update to use_ubatching in 0.14.0
-                # Determine number of metadata builders needed
-                # If enable_dbo, need 2 builders
-                # If enable_dual_stream_wrapper, also need 2 builders (default num_ubatches=2)
-                # Otherwise, need 1 builder
-                enable_dual_stream = getattr(self.parallel_config, 'enable_dual_stream_wrapper', False)
-                if self.parallel_config.enable_dbo or enable_dual_stream:
-                    num_builders = 2
-                else:
-                    num_builders = 1
-                
+                # Dual-stream wrapper also needs 2 metadata builders
+                # (same as DBO) to handle split batches.
+                _needs_two_builders = (
+                    self.parallel_config.enable_dbo
+                    or getattr(self.parallel_config,
+                               'enable_dual_stream_wrapper', False))
                 attn_metadata_builders = [
                     attn_backend.get_builder_cls()(
                         kv_cache_spec,
                         layer_names,
                         self.vllm_config,
                         self.device,
-                    ) for _ in range(num_builders)
+                    ) for _ in range(2 if _needs_two_builders else 1)
                 ]
 
                 attn_group = AttentionGroup(attn_backend, layer_names,

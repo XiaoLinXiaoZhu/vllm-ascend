@@ -1,19 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+Dual-stream batch wrapper for NPU inference.
+
+This module implements a dual-stream execution model that captures and replays
+ACL graphs on two independent NPU streams with separate graph pools. During
+the capture phase the full batch is used to record identical graphs on both
+streams. At runtime the input is split in half and the two halves are executed
+concurrently on the two streams, then the outputs are concatenated.
+
+The wrapper is activated by setting ``parallel_config.enable_dual_stream_wrapper``
+to ``True``.  It is independent of DBO (dual-batch overlap) and can be combined
+with or used instead of it.
+"""
 
 import threading
-from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.distributed import (get_pp_group,
-                              get_tensor_model_parallel_world_size,
-                              tensor_model_parallel_all_gather)
+from vllm.distributed import get_pp_group
 from vllm.distributed.device_communicators.pynccl_allocator import \
     set_graph_pool_id
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
@@ -21,335 +32,332 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 logger = init_logger(__name__)
 
 
-@dataclass
-class DualStreamGraphEntry:
-    """Entry for dual stream graph, similar to ACLGraphEntry"""
-    batch_descriptor: BatchDescriptor
-    aclgraph_0: torch.npu.NPUGraph | None = None
-    aclgraph_1: torch.npu.NPUGraph | None = None
-    graph_pool_0: Any = None
-    graph_pool_1: Any = None
-    compute_stream_0: torch.npu.Stream | None = None
-    compute_stream_1: torch.npu.Stream | None = None
-    output_0: Any | None = None
-    output_1: Any | None = None
-    # Store input addresses and tensors from capture for replay
-    # Separate buffers for each stream
-    input_addresses_0: list[int] | None = None
-    input_addresses_1: list[int] | None = None
-    capture_input_ids_0: torch.Tensor | None = None
-    capture_positions_0: torch.Tensor | None = None
-    capture_inputs_embeds_0: torch.Tensor | None = None
-    capture_intermediate_tensors_0: Any | None = None
-    capture_input_ids_1: torch.Tensor | None = None
-    capture_positions_1: torch.Tensor | None = None
-    capture_inputs_embeds_1: torch.Tensor | None = None
-    capture_intermediate_tensors_1: Any | None = None
+class _GraphRecord:
+    """Stores everything needed to replay a captured dual-stream graph."""
+
+    __slots__ = (
+        "graph_a",
+        "graph_b",
+        "pool_a",
+        "pool_b",
+        "stream_a",
+        "stream_b",
+        "output_a",
+        "output_b",
+        "buf_input_ids_a",
+        "buf_positions_a",
+        "buf_embeds_a",
+        "buf_intermediates_a",
+        "buf_input_ids_b",
+        "buf_positions_b",
+        "buf_embeds_b",
+        "buf_intermediates_b",
+    )
+
+    def __init__(self) -> None:
+        self.graph_a: torch.npu.NPUGraph | None = None
+        self.graph_b: torch.npu.NPUGraph | None = None
+        self.pool_a: Any = None
+        self.pool_b: Any = None
+        self.stream_a: torch.npu.Stream | None = None
+        self.stream_b: torch.npu.Stream | None = None
+        self.output_a: Any = None
+        self.output_b: Any = None
+        # Capture-time input buffers for stream A
+        self.buf_input_ids_a: torch.Tensor | None = None
+        self.buf_positions_a: torch.Tensor | None = None
+        self.buf_embeds_a: torch.Tensor | None = None
+        self.buf_intermediates_a: IntermediateTensors | None = None
+        # Capture-time input buffers for stream B
+        self.buf_input_ids_b: torch.Tensor | None = None
+        self.buf_positions_b: torch.Tensor | None = None
+        self.buf_embeds_b: torch.Tensor | None = None
+        self.buf_intermediates_b: IntermediateTensors | None = None
 
 
 class DualStreamUBatchWrapper(UBatchWrapper):
-    """
-    Wrapper that captures and replays ACLgraphs on dual streams.
-    
-    Capture phase: Uses full batch data (like ACLGraphWrapper) to capture
-    the same graph on two separate streams with separate graph pools.
-    
-    Runtime phase: Splits input data in half and replays both graphs in parallel
-    on two streams, then merges the results.
+    """Wrap a model callable to execute on two NPU streams in parallel.
+
+    Capture phase
+    -------------
+    For each unique ``BatchDescriptor`` the wrapper records an ACL graph on
+    **two** independent streams (each with its own graph pool).  Both graphs
+    see the full (un-split) batch so they capture identical kernels.
+
+    Replay phase
+    ------------
+    The input tensor is split at the midpoint.  The first half is copied into
+    stream-A's capture buffer and replayed; the second half goes to stream-B.
+    A lightweight thread is used for one of the streams so they overlap on the
+    CPU timeline, while ``torch.npu.synchronize()`` ensures both finish before
+    the outputs are concatenated.
     """
 
-    def __init__(self, runnable: Callable, vllm_config: VllmConfig,
-                 runtime_mode: CUDAGraphMode, device: torch.npu.device):
+    def __init__(
+        self,
+        runnable: Callable,
+        vllm_config: VllmConfig,
+        runtime_mode: CUDAGraphMode,
+        device: torch.device,
+    ) -> None:
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
         self.runtime_mode = runtime_mode
         self.device = device
 
-        # Create separate graph pools for two streams
-        self.graph_pool_0 = torch.npu.graph_pool_handle()
-        self.graph_pool_1 = torch.npu.graph_pool_handle()
+        # Two independent graph pools
+        self.pool_a = torch.npu.graph_pool_handle()
+        self.pool_b = torch.npu.graph_pool_handle()
 
-        # Store captured graphs, keyed by batch_descriptor
-        self.graph_entries: dict[BatchDescriptor, DualStreamGraphEntry] = {}
+        # Cache: BatchDescriptor -> _GraphRecord
+        self._records: dict[BatchDescriptor, _GraphRecord] = {}
 
-        # Fallback wrapper for non-FULL modes
-        self.cudagraph_wrapper = None
+        # Fall-back wrapper for piecewise mode
+        self.cudagraph_wrapper: ACLGraphWrapper | None = None
         if runtime_mode is not CUDAGraphMode.NONE:
-            self.cudagraph_wrapper = ACLGraphWrapper(runnable,
-                                                     vllm_config,
-                                                     runtime_mode=runtime_mode)
+            self.cudagraph_wrapper = ACLGraphWrapper(
+                runnable, vllm_config, runtime_mode=runtime_mode)
 
-    def __getattr__(self, key: str):
-        # allow accessing the attributes of the runnable.
-        if hasattr(self.runnable, key):
-            return getattr(self.runnable, key)
-        raise AttributeError(f"Attribute {key} not exists in the runnable of "
-                             f"dual stream wrapper: {self.runnable}")
+    # ------------------------------------------------------------------
+    # Attribute forwarding
+    # ------------------------------------------------------------------
+    def __getattr__(self, name: str):
+        if hasattr(self.runnable, name):
+            return getattr(self.runnable, name)
+        raise AttributeError(
+            f"'{type(self).__name__}' wrapper has no attribute '{name}' "
+            f"and neither does the wrapped runnable ({type(self.runnable).__name__})"
+        )
 
     def unwrap(self) -> Callable:
-        # in case we need to access the original runnable.
         return self.runnable
 
-    def _split_inputs(self, input_ids, positions, inputs_embeds, 
-                     intermediate_tensors, num_tokens):
-        """Split inputs in half for dual stream execution."""
-        split_point = num_tokens // 2
-        
-        # Split input_ids
-        input_ids_0 = input_ids[:split_point]
-        input_ids_1 = input_ids[split_point:]
-        
-        # Split positions
-        if positions.ndim == 2:
-            positions_0 = positions[:, :split_point]
-            positions_1 = positions[:, split_point:]
-        else:
-            positions_0 = positions[:split_point]
-            positions_1 = positions[split_point:]
-        
-        # Split inputs_embeds
-        inputs_embeds_0 = inputs_embeds[:split_point] if inputs_embeds is not None else None
-        inputs_embeds_1 = inputs_embeds[split_point:] if inputs_embeds is not None else None
-        
-        # Split intermediate_tensors
-        intermediate_tensors_0 = None
-        intermediate_tensors_1 = None
-        if intermediate_tensors is not None:
-            from vllm.sequence import IntermediateTensors
-            tensors_0 = {}
-            tensors_1 = {}
-            for key, tensor in intermediate_tensors.tensors.items():
-                tensors_0[key] = tensor[:split_point]
-                tensors_1[key] = tensor[split_point:]
-            intermediate_tensors_0 = IntermediateTensors(tensors_0)
-            intermediate_tensors_1 = IntermediateTensors(tensors_1)
-        
-        return (input_ids_0, positions_0, inputs_embeds_0, intermediate_tensors_0,
-                input_ids_1, positions_1, inputs_embeds_1, intermediate_tensors_1)
+    # ------------------------------------------------------------------
+    # Input splitting helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _split_tensor(tensor: torch.Tensor | None, mid: int,
+                      is_2d: bool = False):
+        """Return (first_half, second_half) of *tensor* along the token dim."""
+        if tensor is None:
+            return None, None
+        if is_2d and tensor.ndim == 2:
+            return tensor[:, :mid], tensor[:, mid:]
+        return tensor[:mid], tensor[mid:]
 
-    def _capture_dual_streams(self, *args, **kwargs) -> torch.Tensor:
-        """
-        Capture ACLgraphs on two streams using full batch data.
-        Similar to ACLGraphWrapper, but captures on two separate streams.
-        """
-        forward_context = get_forward_context()
-        batch_descriptor = forward_context.batch_descriptor
-        
-        # Create entry if not exists
-        if batch_descriptor not in self.graph_entries:
-            self.graph_entries[batch_descriptor] = DualStreamGraphEntry(
-                batch_descriptor=batch_descriptor)
-        
-        entry = self.graph_entries[batch_descriptor]
-        
-        # Store input addresses and tensors for replay
-        input_ids = kwargs.get('input_ids')
-        positions = kwargs.get('positions')
-        inputs_embeds = kwargs.get('inputs_embeds')
-        intermediate_tensors = kwargs.get('intermediate_tensors')
-        
-        # Create separate input buffers for each stream
-        # These will be used during replay to copy split data
-        entry.capture_input_ids_0 = input_ids.clone() if input_ids is not None else None
-        entry.capture_positions_0 = positions.clone() if positions is not None else None
-        entry.capture_inputs_embeds_0 = inputs_embeds.clone() if inputs_embeds is not None else None
-        entry.capture_input_ids_1 = input_ids.clone() if input_ids is not None else None
-        entry.capture_positions_1 = positions.clone() if positions is not None else None
-        entry.capture_inputs_embeds_1 = inputs_embeds.clone() if inputs_embeds is not None else None
-        
-        if intermediate_tensors is not None:
-            from vllm.sequence import IntermediateTensors
-            entry.capture_intermediate_tensors_0 = IntermediateTensors({
-                key: tensor.clone() for key, tensor in intermediate_tensors.tensors.items()
-            })
-            entry.capture_intermediate_tensors_1 = IntermediateTensors({
-                key: tensor.clone() for key, tensor in intermediate_tensors.tensors.items()
-            })
-        
-        # Get input addresses from args (tensors) - these will be the same for both graphs
-        # during capture, but we'll use separate buffers during replay
-        input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
-        entry.input_addresses_0 = input_addresses
-        entry.input_addresses_1 = input_addresses
-        
-        # Create two separate compute streams
-        compute_stream_0 = torch.npu.Stream(device=self.device)
-        compute_stream_1 = torch.npu.Stream(device=self.device)
-        entry.compute_stream_0 = compute_stream_0
-        entry.compute_stream_1 = compute_stream_1
-        
-        # Save original values and temporarily set to avoid nested graph capture and ubatch issues
-        original_runtime_mode = forward_context.cudagraph_runtime_mode
-        original_ubatch_slices = forward_context.ubatch_slices
-        
-        # Temporarily set ubatch_slices to None to avoid creating multiple metadata builders
-        forward_context.ubatch_slices = None
-        
-        # Capture graph on stream 0 (using full batch data)
-        aclgraph_0 = torch.npu.NPUGraph()
-        set_graph_pool_id(self.graph_pool_0)
-        forward_context.capturing = True
-        forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE  # Avoid nested capture
-        with torch.npu.graph(aclgraph_0, stream=compute_stream_0, pool=self.graph_pool_0):
-            output_0 = self.runnable(*args, **kwargs)
-        
-        # Capture graph on stream 1 (using same full batch data)
-        aclgraph_1 = torch.npu.NPUGraph()
-        set_graph_pool_id(self.graph_pool_1)
-        forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE  # Avoid nested capture
-        with torch.npu.graph(aclgraph_1, stream=compute_stream_1, pool=self.graph_pool_1):
-            output_1 = self.runnable(*args, **kwargs)
-        
-        # Restore original values
-        forward_context.cudagraph_runtime_mode = original_runtime_mode
-        forward_context.ubatch_slices = original_ubatch_slices
-        
-        # Store captured graphs and outputs
-        entry.aclgraph_0 = aclgraph_0
-        entry.aclgraph_1 = aclgraph_1
-        entry.graph_pool_0 = self.graph_pool_0
-        entry.graph_pool_1 = self.graph_pool_1
-        entry.output_0 = output_0
-        entry.output_1 = output_1
-        
-        # Return combined output (for capture, we return the first output)
-        return output_0
+    @staticmethod
+    def _split_intermediates(intermediates: IntermediateTensors | None,
+                             mid: int):
+        if intermediates is None:
+            return None, None
+        tensors_a, tensors_b = {}, {}
+        for key, val in intermediates.tensors.items():
+            tensors_a[key] = val[:mid]
+            tensors_b[key] = val[mid:]
+        return IntermediateTensors(tensors_a), IntermediateTensors(tensors_b)
 
-    def _run_dual_streams(self, *args, **kwargs) -> torch.Tensor:
-        """
-        Run on dual streams using the same full data (not split).
-        Copies full input data to capture buffers and replays both graphs in parallel.
-        """
-        forward_context = get_forward_context()
-        batch_descriptor = forward_context.batch_descriptor
-        
-        entry = self.graph_entries.get(batch_descriptor)
-        if entry is None or entry.aclgraph_0 is None or entry.aclgraph_1 is None:
-            # Fallback to single stream if graph not captured
-            return self.runnable(*args, **kwargs)
-        
-        # Save original ubatch_slices and temporarily set to None
-        original_ubatch_slices = forward_context.ubatch_slices
-        forward_context.ubatch_slices = None
-        
-        try:
-            # Extract inputs
-            input_ids = kwargs.get('input_ids')
-            positions = kwargs.get('positions')
-            inputs_embeds = kwargs.get('inputs_embeds')
-            intermediate_tensors = kwargs.get('intermediate_tensors')
-            
-            num_tokens = input_ids.shape[0] if input_ids is not None else positions.shape[0]
-            
-            # Copy full data to capture buffers (not split)
-            # For stream 0: copy full data to buffer 0
-            if entry.capture_input_ids_0 is not None and input_ids is not None:
-                entry.capture_input_ids_0[:num_tokens].copy_(input_ids)
-            if entry.capture_positions_0 is not None and positions is not None:
-                if positions.ndim == 2:
-                    entry.capture_positions_0[:, :num_tokens].copy_(positions)
-                else:
-                    entry.capture_positions_0[:num_tokens].copy_(positions)
-            if entry.capture_inputs_embeds_0 is not None and inputs_embeds is not None:
-                entry.capture_inputs_embeds_0[:num_tokens].copy_(inputs_embeds)
-            if entry.capture_intermediate_tensors_0 is not None and intermediate_tensors is not None:
-                for key in intermediate_tensors.tensors:
-                    if key in entry.capture_intermediate_tensors_0.tensors:
-                        entry.capture_intermediate_tensors_0.tensors[key][:num_tokens].copy_(
-                            intermediate_tensors.tensors[key])
-            
-            # For stream 1: copy full data to buffer 1
-            if entry.capture_input_ids_1 is not None and input_ids is not None:
-                entry.capture_input_ids_1[:num_tokens].copy_(input_ids)
-            if entry.capture_positions_1 is not None and positions is not None:
-                if positions.ndim == 2:
-                    entry.capture_positions_1[:, :num_tokens].copy_(positions)
-                else:
-                    entry.capture_positions_1[:num_tokens].copy_(positions)
-            if entry.capture_inputs_embeds_1 is not None and inputs_embeds is not None:
-                entry.capture_inputs_embeds_1[:num_tokens].copy_(inputs_embeds)
-            if entry.capture_intermediate_tensors_1 is not None and intermediate_tensors is not None:
-                for key in intermediate_tensors.tensors:
-                    if key in entry.capture_intermediate_tensors_1.tensors:
-                        entry.capture_intermediate_tensors_1.tensors[key][:num_tokens].copy_(
-                            intermediate_tensors.tensors[key])
-            
-            # Run on two streams in parallel
-            results = [None, None]
-            errors = [None, None]
-            
-            def run_stream_0():
-                try:
-                    torch.npu.set_device(self.device)
-                    set_graph_pool_id(entry.graph_pool_0)
-                    with torch.npu.stream(entry.compute_stream_0):
-                        torch.npu.synchronize()
-                        entry.aclgraph_0.replay()
-                    results[0] = entry.output_0[:num_tokens] if entry.output_0 is not None else None
-                except Exception as e:
-                    errors[0] = e
-            
-            def run_stream_1():
-                try:
-                    torch.npu.set_device(self.device)
-                    set_graph_pool_id(entry.graph_pool_1)
-                    with torch.npu.stream(entry.compute_stream_1):
-                        torch.npu.synchronize()
-                        entry.aclgraph_1.replay()
-                    results[1] = entry.output_1[:num_tokens] if entry.output_1 is not None else None
-                except Exception as e:
-                    errors[1] = e
-            
-            # Launch threads
-            thread_0 = threading.Thread(target=run_stream_0)
-            thread_1 = threading.Thread(target=run_stream_1)
-            
-            thread_0.start()
-            thread_1.start()
-            thread_0.join()
-            thread_1.join()
-            
-            # Check for errors
-            if errors[0] is not None:
-                raise errors[0]
-            if errors[1] is not None:
-                raise errors[1]
-            
-            # Both streams used the same full data, so results should be the same
-            # Use result from stream 0 (or stream 1 if stream 0 failed)
-            if results[0] is not None:
-                return results[0]
-            elif results[1] is not None:
-                return results[1]
+    # ------------------------------------------------------------------
+    # Copy helpers (for replay – writes into capture buffers)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _copy_into_buffer(buf: torch.Tensor | None, src: torch.Tensor | None,
+                          n: int):
+        if buf is not None and src is not None:
+            if buf.ndim == 2 and src.ndim == 2:
+                buf[:, :n].copy_(src[:, :n])
             else:
-                raise RuntimeError("No results from dual stream execution")
-        finally:
-            # Restore original ubatch_slices
-            forward_context.ubatch_slices = original_ubatch_slices
+                buf[:n].copy_(src[:n])
 
+    @staticmethod
+    def _copy_intermediates_into_buffer(
+        buf: IntermediateTensors | None,
+        src: IntermediateTensors | None,
+        n: int,
+    ):
+        if buf is not None and src is not None:
+            for key in src.tensors:
+                if key in buf.tensors:
+                    buf.tensors[key][:n].copy_(src.tensors[key][:n])
+
+    # ------------------------------------------------------------------
+    # Capture
+    # ------------------------------------------------------------------
+    def _capture_graphs(self, input_ids, positions, inputs_embeds,
+                        intermediate_tensors) -> torch.Tensor:
+        """Capture the same model graph on two streams sequentially."""
+        fwd_ctx = get_forward_context()
+        bd = fwd_ctx.batch_descriptor
+        assert bd is not None
+
+        rec = _GraphRecord()
+        rec.pool_a = self.pool_a
+        rec.pool_b = self.pool_b
+        rec.stream_a = torch.npu.Stream(device=self.device)
+        rec.stream_b = torch.npu.Stream(device=self.device)
+
+        # Capture helper – records a graph on *stream* with *pool*.
+        def _do_capture(stream: torch.npu.Stream, pool):
+            set_graph_pool_id(pool)
+            graph = torch.npu.NPUGraph()
+            with torch.npu.stream(stream):
+                # Warm-up to init BLAS handle in this stream context
+                _ = torch.npu.current_blas_handle()
+            with torch.npu.graph(graph, stream=stream, pool=pool):
+                out = self.runnable(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                )
+            return graph, out
+
+        # Capture on stream A
+        rec.graph_a, rec.output_a = _do_capture(rec.stream_a, rec.pool_a)
+        # Snapshot input buffers for stream A
+        rec.buf_input_ids_a = input_ids.clone() if input_ids is not None else None
+        rec.buf_positions_a = positions.clone() if positions is not None else None
+        rec.buf_embeds_a = inputs_embeds.clone() if inputs_embeds is not None else None
+        if intermediate_tensors is not None:
+            rec.buf_intermediates_a = IntermediateTensors(
+                {k: v.clone() for k, v in intermediate_tensors.tensors.items()})
+
+        # Capture on stream B
+        rec.graph_b, rec.output_b = _do_capture(rec.stream_b, rec.pool_b)
+        rec.buf_input_ids_b = input_ids.clone() if input_ids is not None else None
+        rec.buf_positions_b = positions.clone() if positions is not None else None
+        rec.buf_embeds_b = inputs_embeds.clone() if inputs_embeds is not None else None
+        if intermediate_tensors is not None:
+            rec.buf_intermediates_b = IntermediateTensors(
+                {k: v.clone() for k, v in intermediate_tensors.tensors.items()})
+
+        self._records[bd] = rec
+
+        # During capture we just return the output from stream A (full batch)
+        return rec.output_a
+
+    # ------------------------------------------------------------------
+    # Replay
+    # ------------------------------------------------------------------
+    def _replay_graphs(self, input_ids, positions, inputs_embeds,
+                       intermediate_tensors,
+                       num_tokens: int) -> torch.Tensor:
+        """Split inputs and replay graphs on two streams concurrently."""
+        fwd_ctx = get_forward_context()
+        bd = fwd_ctx.batch_descriptor
+        rec = self._records[bd]
+
+        mid = num_tokens // 2
+        tail = num_tokens - mid
+
+        # Split inputs
+        ids_a, ids_b = self._split_tensor(input_ids, mid)
+        pos_a, pos_b = self._split_tensor(positions, mid,
+                                           is_2d=(positions is not None
+                                                  and positions.ndim == 2))
+        emb_a, emb_b = self._split_tensor(inputs_embeds, mid)
+        int_a, int_b = self._split_intermediates(intermediate_tensors, mid)
+
+        # Copy into capture buffers
+        self._copy_into_buffer(rec.buf_input_ids_a, ids_a, mid)
+        self._copy_into_buffer(rec.buf_positions_a, pos_a, mid)
+        self._copy_into_buffer(rec.buf_embeds_a, emb_a, mid)
+        self._copy_intermediates_into_buffer(rec.buf_intermediates_a, int_a,
+                                             mid)
+
+        self._copy_into_buffer(rec.buf_input_ids_b, ids_b, tail)
+        self._copy_into_buffer(rec.buf_positions_b, pos_b, tail)
+        self._copy_into_buffer(rec.buf_embeds_b, emb_b, tail)
+        self._copy_intermediates_into_buffer(rec.buf_intermediates_b, int_b,
+                                             tail)
+
+        # Replay on two streams concurrently using a helper thread
+        errors: list[Exception | None] = [None, None]
+
+        def _replay_on_stream_b():
+            try:
+                torch.npu.set_device(self.device)
+                set_graph_pool_id(rec.pool_b)
+                with torch.npu.stream(rec.stream_b):
+                    rec.graph_b.replay()
+            except Exception as exc:  # noqa: BLE001
+                errors[1] = exc
+
+        thread_b = threading.Thread(target=_replay_on_stream_b)
+        thread_b.start()
+
+        # Stream A runs on the current thread
+        set_graph_pool_id(rec.pool_a)
+        with torch.npu.stream(rec.stream_a):
+            rec.graph_a.replay()
+
+        thread_b.join()
+
+        # Propagate errors
+        for idx, err in enumerate(errors):
+            if err is not None:
+                raise RuntimeError(
+                    f"Dual-stream replay failed on stream "
+                    f"{'B' if idx else 'A'}") from err
+
+        # Wait for both streams to finish on the device
+        torch.npu.synchronize()
+
+        # Gather outputs
+        out_a = rec.output_a[:mid] if rec.output_a is not None else None
+        out_b = rec.output_b[:tail] if rec.output_b is not None else None
+
+        if out_a is not None and out_b is not None:
+            if not get_pp_group().is_last_rank:
+                return self._merge_intermediate_outputs(out_a, out_b)
+            return torch.cat([out_a, out_b], dim=0)
+        # Fallback – should not normally happen
+        return out_a if out_a is not None else out_b
+
+    # ------------------------------------------------------------------
+    # Intermediate tensor merging (pipeline-parallel)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _merge_intermediate_outputs(a, b):
+        """Merge IntermediateTensors from two streams for PP scenarios."""
+        if isinstance(a, IntermediateTensors) and isinstance(
+                b, IntermediateTensors):
+            merged = {}
+            for key in a.tensors:
+                merged[key] = torch.cat([a.tensors[key], b.tensors[key]],
+                                        dim=0)
+            return IntermediateTensors(merged)
+        # Plain tensors
+        return torch.cat([a, b], dim=0)
+
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
     def __call__(self, *args, **kwargs):
-        forward_context = get_forward_context()
-        batch_descriptor = forward_context.batch_descriptor
-        aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
+        fwd_ctx = get_forward_context()
+        bd = fwd_ctx.batch_descriptor
+        runtime_mode = fwd_ctx.cudagraph_runtime_mode
 
-        # Only use dual stream if ACLgraph is enabled
-        # Don't depend on ubatch_slices or FULL mode - we handle data splitting ourselves
-        if aclgraph_runtime_mode != CUDAGraphMode.NONE:
-            # Using ACLgraph: capture or replay on dual streams
-            assert batch_descriptor is not None
-            
-            # Check if graph needs to be captured
-            if batch_descriptor not in self.graph_entries or \
-               self.graph_entries[batch_descriptor].aclgraph_0 is None:
-                # Capture phase: use full batch data
-                return self._capture_dual_streams(*args, **kwargs)
-            else:
-                # Runtime phase: split data and run on dual streams
-                return self._run_dual_streams(*args, **kwargs)
-        else:
-            # No ACLgraph: fallback to runnable or cudagraph_wrapper
+        if runtime_mode == CUDAGraphMode.NONE:
+            # No graph – run eagerly or via piecewise wrapper
             if self.cudagraph_wrapper is not None:
                 return self.cudagraph_wrapper(*args, **kwargs)
-            else:
-                return self.runnable(*args, **kwargs)
+            return self.runnable(*args, **kwargs)
+
+        # ACL graph path
+        assert bd is not None
+        input_ids = kwargs.get("input_ids")
+        positions = kwargs.get("positions")
+        inputs_embeds = kwargs.get("inputs_embeds")
+        intermediate_tensors = kwargs.get("intermediate_tensors")
+
+        if bd not in self._records or self._records[bd].graph_a is None:
+            # First time for this shape – capture
+            return self._capture_graphs(input_ids, positions, inputs_embeds,
+                                        intermediate_tensors)
+
+        # Replay
+        num_tokens = (input_ids.shape[0]
+                      if input_ids is not None else positions.shape[-1])
+        return self._replay_graphs(input_ids, positions, inputs_embeds,
+                                   intermediate_tensors, num_tokens)
